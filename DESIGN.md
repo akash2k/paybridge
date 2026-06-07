@@ -277,7 +277,313 @@ Created ──▶ FraudChecking ──fraud fail──▶ Failed  │
 
 `Refunded` is defined in the enum but not yet wired up to a flow.
 
-## 10. Known Limitations and Future Work
+## 10. SLO Definitions
+
+Three SLOs are defined for the production PayBridge service. Each includes the signal being measured, the target, and the alerting strategy.
+
+---
+
+### SLO 1 — Payment Success Rate ≥ 99.5% (30-day rolling window)
+
+**What we measure**
+
+The fraction of payment creation requests that result in a terminal `Completed` or `Submitted` (pending async confirmation) status, excluding requests rejected by fraud screening (fraud rejection is expected behaviour, not a system error).
+
+```
+success_rate = 1 - (
+  rate(paybridge_payments_created_total{status="Failed"}[30d])
+  /
+  rate(paybridge_payments_created_total[30d])
+)
+```
+
+**Target:** 99.5% — no more than 0.5% of payments fail due to system errors (provider unavailability, DB errors, infrastructure faults) over any 30-day window.
+
+**Error budget:** 0.5% of requests over 30 days ≈ 216 minutes of total failure time at 1 req/s.
+
+**Alerting**
+
+| Severity | Condition | Action |
+|---|---|---|
+| Page (P1) | Error rate > 2% for 5 minutes | Immediate on-call response — circuit breaker likely open or provider down |
+| Ticket (P2) | Error rate > 0.5% for 30 minutes | Error budget burn rate > 1× — investigate before budget is exhausted |
+| Burn-rate alert | 5% of 30-day budget consumed in 1 hour | Fast burn — escalate if trend continues |
+
+---
+
+### SLO 2 — Payment API p99 Latency ≤ 2 seconds (synchronous path)
+
+**What we measure**
+
+End-to-end response time for `POST /api/payments` — from request receipt to `201 Created` response. This covers the synchronous path: idempotency check → fraud gRPC → provider HTTP → Kafka publish. The async webhook/settlement leg is excluded.
+
+```
+histogram_quantile(0.99,
+  sum(rate(paybridge_payment_processing_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+**Target:** p99 ≤ 2 seconds. The 2-second budget is allocated as: fraud gRPC ≤ 300ms, provider HTTP ≤ 1200ms (including one retry), Postgres writes ≤ 100ms, Redis ≤ 50ms, overhead ≤ 350ms.
+
+**Error budget:** 1% of requests per month may exceed 2s ≈ ~14,400 slow requests at 1 req/s.
+
+**Alerting**
+
+| Severity | Condition | Action |
+|---|---|---|
+| Page (P1) | p99 > 5s for 3 minutes | Provider circuit breaker likely open or DB overloaded |
+| Ticket (P2) | p99 > 2s for 10 minutes | Latency SLO at risk — check fraud service and provider tail latency |
+| Warning | p95 > 1.5s for 15 minutes | Early signal before p99 breaches — review provider response times |
+
+---
+
+### SLO 3 — Settlement Lag ≤ 60 seconds (p95, end-to-end)
+
+**What we measure**
+
+Time from when a `PaymentCompleted` or `PaymentFailed` webhook is received by `WebhookReceiver` to when the corresponding `SettlementRecord` is persisted. This covers: webhook dedup check (Redis) → Kafka publish → Kafka consumer poll → DB upsert.
+
+Approximated as:
+```
+histogram_quantile(0.95,
+  sum(rate(paybridge_settlement_processing_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+For deeper end-to-end measurement, compare `SettlementRecord.PersistedAt - PaymentEvent.Timestamp` in Postgres.
+
+**Target:** p95 settlement lag ≤ 60 seconds. The dominant driver is Kafka consumer poll interval (default 1s) plus DB write time. Breaching this SLO indicates consumer lag is building or the settlement consumer is stopped.
+
+**Error budget:** 5% of settlements per month may exceed 60s.
+
+**Alerting**
+
+| Severity | Condition | Action |
+|---|---|---|
+| Page (P1) | No settlements persisted in 5 minutes despite incoming webhooks | Consumer is stopped or Kafka consumer group is stuck |
+| Ticket (P2) | p95 settlement lag > 60s for 10 minutes | Consumer throughput degraded — check Kafka consumer lag metric |
+| Warning | `paybridge_settlement_records_persisted_total` rate = 0 for 2 minutes | Possible consumer crash — check pod restarts |
+
+---
+
+## 11. Incident Runbook — Payment Success Rate Dropped
+
+**Trigger:** P1 alert fires — `paybridge_payments_created_total{status="Failed"}` error rate exceeds 2% for 5 consecutive minutes.
+
+---
+
+### Step 1 — Confirm scope (2 minutes)
+
+```bash
+# Is the drop recent and sharp, or a slow trend?
+# Check Grafana → PayBridge Overview → "Payments by Status" panel
+
+# Is it affecting all merchants or one?
+# Query Prometheus:
+sum by (status) (rate(paybridge_payments_created_total[5m]))
+```
+
+If error rate is 100%: likely a full infrastructure failure (Postgres down, Redis unavailable).
+If error rate is 5–20%: likely provider-side failures or fraud service degradation.
+
+---
+
+### Step 2 — Check the provider circuit breaker (3 minutes)
+
+The most common cause of elevated failure rates is the provider circuit breaker opening.
+
+```bash
+# Look for circuit breaker log events:
+docker logs deploy-payment-api-1 2>&1 | grep "Circuit breaker"
+
+# Check provider stub health:
+curl -s http://localhost:8082/health
+
+# Check payment-api logs for provider errors:
+docker logs deploy-payment-api-1 2>&1 | grep -E "Provider|provider" | tail -20
+```
+
+**If the circuit breaker is open:**
+- Wait for the 60-second break duration to elapse (automatic recovery)
+- If provider remains unhealthy after recovery: activate the kill switch to stop new payments from accumulating failures while the provider incident is resolved
+  ```bash
+  redis-cli SET flags:payment_processing false
+  ```
+- Notify merchants via status page
+
+---
+
+### Step 3 — Check Postgres and Redis (3 minutes)
+
+```bash
+# Health endpoints:
+curl -s http://localhost:8080/health/ready   # checks both Postgres + Redis
+
+# Postgres connectivity:
+docker logs deploy-postgres-1 2>&1 | tail -20
+
+# Redis connectivity:
+docker exec deploy-redis-1 redis-cli ping
+```
+
+**If Postgres is down:** payments will fail at the initial `INSERT`. Activate kill switch to prevent error storm, restore Postgres, then re-enable.
+
+**If Redis is down:** idempotency and feature flag checks will fail. The `RedisIdempotencyService` does not have a fallback — payments will return 500. Restore Redis or temporarily swap `IIdempotencyService` to a no-op implementation.
+
+---
+
+### Step 4 — Check the fraud service (2 minutes)
+
+```bash
+docker logs deploy-fraud-stub-1 2>&1 | tail -20
+curl -s http://localhost:8081/health
+```
+
+The fraud service is **fail-open** — a timeout or error causes payments to proceed with `RiskScore=0.5`. Fraud service failure alone should not cause payment failures. If fraud is returning errors AND payments are failing, the failure is happening downstream of fraud.
+
+---
+
+### Step 5 — Check for Outbox backlog (2 minutes)
+
+If payments are succeeding but events are not being delivered, the Kafka producer may be failing silently and the outbox is filling up.
+
+```bash
+# Check outbox backlog size:
+docker exec deploy-postgres-1 psql -U paybridge -c \
+  'SELECT COUNT(*) FROM "OutboxEvents" WHERE "ProcessedAt" IS NULL;'
+
+# Check outbox worker errors:
+docker logs deploy-payment-api-1 2>&1 | grep "Outbox" | tail -10
+```
+
+If the backlog exceeds 1,000 rows, Kafka is likely down or unreachable. Restore Kafka — the OutboxWorker will drain automatically.
+
+---
+
+### Mitigation Summary
+
+| Root Cause | Mitigation |
+|---|---|
+| Provider circuit breaker open | Wait for auto-recovery; kill switch if provider is down for > 5 min |
+| Postgres unavailable | Restore Postgres; kill switch to halt new requests during recovery |
+| Redis unavailable | Restore Redis; consider no-op idempotency fallback |
+| Kafka unavailable | Outbox guarantees no event loss; restore Kafka to drain backlog |
+| Fraud service crashing | No action needed (fail-open); alerts for fraud are tagged `degraded` |
+
+---
+
+## 12. PII and Data Governance
+
+PayBridge processes three categories of sensitive data: customer PII (email address), financial data (payment amount, currency, method), and merchant data (merchant ID, tenant ID).
+
+### 12.1 Customer Email
+
+**Storage:** Customer email is **never persisted** to the database. The `CreatePaymentRequest` record carries the email only in memory during the synchronous request path.
+
+**Transmission:** Before the email is sent to the fraud service, `FraudGrpcClient` hashes it using SHA-256 and truncates to 16 hex characters (`customer_email_hash`). Only this one-way hash crosses the wire. The original email is not included in any Kafka event, outbox record, or structured log field.
+
+**Logs and traces:** No log statement in any service references `CustomerEmail` directly. OTel span attributes carry `payment.merchant_id`, `payment.currency`, and `payment.method` — never cardholder data. The OTel Collector pipeline includes an `attributes/drop_pii` processor that explicitly deletes `db.statement` and `http.request.header.authorization` from all metric streams.
+
+### 12.2 Payment Amounts
+
+**Storage:** `Amount` is stored as `DECIMAL(18,4)` in both `Payments` and `SettlementRecords`. This is financial data, not PII, but it is sensitive.
+
+**Metrics:** Amount values are never used as metric label dimensions. Metrics use bucketed enumerations (`risk_bucket: low/medium/high/critical`, `method: CreditCard/...`, `status: Completed/Failed`). This prevents high-cardinality label explosion and avoids leaking individual transaction amounts into the metrics pipeline.
+
+**Traces:** OTel span attributes include `payment.amount` for the payment creation span. In a production deployment, this attribute should be removed or replaced with an amount range (e.g., `payment.amount_bucket: 0-100/100-1000/1000+`) to prevent financial data appearing in trace storage systems that may have different retention and access controls than the primary database.
+
+### 12.3 Merchant Data
+
+Merchant IDs and tenant IDs are considered non-sensitive operational identifiers and are safe to include in logs, traces, and metrics labels. They carry no cardholder information.
+
+### 12.4 Retention
+
+| Data | Storage | Retention |
+|---|---|---|
+| Payment records | Postgres | Indefinite (configurable per-tenant via partition or archival job) |
+| Settlement records | Postgres | Indefinite (financial audit trail) |
+| Idempotency cache | Redis | 24 hours (auto-expiry) |
+| Trace context (Redis) | Redis | 48 hours (auto-expiry) |
+| Webhook dedup keys | Redis | 7 days (auto-expiry) |
+| Distributed traces | Jaeger | Default: in-memory, no persistence. Production: configure OTEL backend with 30-day retention |
+| Metrics | Prometheus | Default: local TSDB. Production: configure remote_write to long-term store (e.g., Thanos, Cortex) with 13-month retention |
+
+### 12.5 Access Controls (Production Guidance)
+
+- Postgres: per-service credentials with least-privilege (PaymentApi has INSERT/UPDATE on Payments and OutboxEvents; SettlementConsumer has INSERT on SettlementRecords, UPDATE on Payments; no service has DELETE)
+- Redis: ACL rules restricting each service to its own key prefix
+- Kafka: mTLS between brokers and clients; per-service ACLs on the `payment-events` topic
+- OTel Collector: runs inside the private network; OTLP ports (4317/4318) are not exposed externally
+
+---
+
+## 13. Cost Awareness at 1,000 Payments/Minute
+
+At 1,000 payments/minute (≈ 16.7 req/s), the primary observability cost drivers are trace volume, metric cardinality, and log throughput.
+
+### 13.1 Trace Volume
+
+Each payment creates approximately 8–10 spans:
+- PaymentApi: 1 root span + 1 fraud span + 1 provider span + 1 Kafka publish
+- WebhookReceiver: 1 span
+- SettlementConsumer: 1 span
+- Postgres/Redis/gRPC auto-instrumentation: 3–4 spans
+
+At 1,000 payments/minute → ~10,000 spans/minute → ~600,000 spans/hour.
+
+**Cost mitigations:**
+- **Head-based sampling:** Apply a 10–20% sample rate for non-error traces using the OTel Collector's `probabilistic_sampler` processor. Error traces and fraud-rejected traces remain at 100% to preserve debuggability. This reduces span volume by 80–90% while keeping full fidelity on failures.
+- **Tail-based sampling (preferred):** Use the OTel Collector's `tail_sampling` processor to keep 100% of traces that contain an error span, and sample down to 5% of all-success traces. This requires buffering spans in the collector (memory cost) but eliminates the "sampled away an interesting trace" problem.
+- **Span attribute pruning:** The `attributes/drop_pii` processor already removes `db.statement`. In production, also drop `http.url` (high cardinality from UUIDs in payment ID paths) and replace with a templated route attribute (`/api/payments/{id}`).
+
+### 13.2 Metric Cardinality
+
+The six custom metrics use low-cardinality label sets (`status`, `method`, `result`, `risk_bucket`). At 1,000 payments/minute, these generate approximately:
+- `payments_created_total`: 4 label combinations (status) × 4 (method) = 16 time series
+- `fraud_checks_total`: 2 (result) × 4 (risk_bucket) = 8 time series
+- All others: O(10) time series each
+
+Total custom metric series: < 100. This is negligible for any Prometheus-compatible backend.
+
+**Risk to watch:** ASP.NET Core's default HTTP metrics include `http.route` as a label. A route like `/api/payments/{paymentId}` without template matching would create one time series per unique payment ID — at 1,000 payments/minute this would generate millions of series within hours. The current setup uses route-template instrumentation (ASP.NET Core OTel integration normalises the route), so this is safe. Verify `http_server_request_duration_seconds` labels in Prometheus before deploying.
+
+### 13.3 Log Volume
+
+At 1,000 payments/minute, structured logging produces approximately:
+- PaymentApi: ~5 log lines per payment = 5,000 lines/minute
+- WebhookReceiver: ~3 lines per webhook = 3,000 lines/minute
+- SettlementConsumer: ~4 lines per event = 4,000 lines/minute
+- Total: ~12,000 lines/minute ≈ 720,000 lines/hour
+
+At an average of 200 bytes per line, this is ~144 MB/hour or ~3.4 GB/day. In a managed log aggregation service (e.g., Datadog, Loki), this is the largest variable cost.
+
+**Cost mitigations:**
+- Suppress EF Core query logs below `Warning` — already implemented.
+- Set health-check endpoint logs to `Debug` or exclude them from the OTel pipeline — already filtered from traces (`opt.Filter = ctx => !ctx.Request.Path.StartsWithSegments("/health")`). Apply the same filter to logs.
+- In production, route `Information`-level logs to a cheap cold store (S3 + Athena) and send only `Warning`+  to the hot log aggregation system.
+- Use log sampling for high-frequency `PaymentInitiated` events: log 1-in-10 at `Information`, always log at `Warning`+.
+
+### 13.4 Kafka Retention
+
+At 1,000 payments/minute, the `payment-events` topic produces:
+- ~3 events per payment (Initiated + Completed/Failed) = 3,000 events/minute
+- Average event size: ~300 bytes → ~900 KB/minute → ~1.3 GB/day
+
+Set topic retention to 7 days (≈ 9 GB) with log compaction disabled (events are append-only). In a managed Kafka service, this is the secondary cost driver after traces.
+
+### 13.5 Summary Table
+
+| Component | Volume at 1k pay/min | Primary mitigation |
+|---|---|---|
+| Traces | ~600k spans/hr | Tail-based sampling: 100% errors, 5% successes |
+| Metrics | < 100 time series | Already low-cardinality; monitor `http.route` label |
+| Logs | ~720k lines/hr (144 MB) | Cold-tier for Info, hot-tier for Warning+ |
+| Kafka | ~1.3 GB/day | 7-day retention; no compaction needed |
+| Postgres | ~1,440 payment rows/hr | Partition by month; archive after 90 days |
+
+---
+
+## 14. Known Limitations and Future Work
 
 - **No authentication/authorization** on the PaymentApi. Production deployments would add JWT/mTLS validation and per-merchant API keys.
 - **Single Kafka partition** per payment key. Adding partitioned consumers with consumer group rebalancing requires careful offset management.

@@ -33,10 +33,11 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME:   2000
+      ZOOKEEPER_CLIENT_PORT:          2181
+      ZOOKEEPER_TICK_TIME:            2000
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=*"
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      test: ["CMD-SHELL", "echo srvr | timeout 2 nc localhost 2181 | grep -q 'Zookeeper version' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10

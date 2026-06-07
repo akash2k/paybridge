@@ -147,16 +147,19 @@ public class SettlementWorker : BackgroundService
                 ({0},{1},{2},{3},{4},{5},{6},{7},{8})
             ON CONFLICT ("PaymentId") DO NOTHING
             """,
-            evt.PaymentId,
-            payment?.MerchantId ?? evt.MerchantId,
-            payment?.TenantId   ?? evt.TenantId,
-            payment?.Amount     ?? evt.Amount,
-            payment?.Currency   ?? evt.Currency,
-            finalStatus.ToString(),
-            evt.ProviderTransactionId,
-            evt.Timestamp,
-            DateTime.UtcNow,
-            ct);
+            parameters: new object[]
+            {
+                evt.PaymentId,
+                payment?.MerchantId ?? evt.MerchantId,
+                payment?.TenantId   ?? evt.TenantId,
+                payment?.Amount     ?? evt.Amount,
+                payment?.Currency   ?? evt.Currency,
+                finalStatus.ToString(),
+                evt.ProviderTransactionId ?? (object)DBNull.Value,
+                evt.Timestamp,
+                DateTime.UtcNow
+            },
+            cancellationToken: ct);
 
         sw.Stop();
         ProcessingDuration.Record(sw.Elapsed.TotalSeconds);

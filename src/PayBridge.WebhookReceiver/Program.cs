@@ -86,12 +86,16 @@ app.MapPost("/webhooks/provider", async (
     {
         // Parse stored "traceId:spanId" string
         var parts = originalTraceId.ToString().Split(':');
-        if (parts.Length == 2
-            && ActivityTraceId.TryParse(parts[0], out var traceId)
-            && ActivitySpanId.TryParse(parts[1], out var spanId))
+        if (parts.Length == 2)
         {
-            var linkedCtx = new ActivityContext(traceId, spanId, ActivityTraceFlags.Recorded);
-            links.Add(new ActivityLink(linkedCtx));
+            try
+            {
+                var traceId  = ActivityTraceId.CreateFromString(parts[0].AsSpan());
+                var spanId   = ActivitySpanId.CreateFromString(parts[1].AsSpan());
+                var linkedCtx = new ActivityContext(traceId, spanId, ActivityTraceFlags.Recorded);
+                links.Add(new ActivityLink(linkedCtx));
+            }
+            catch { /* invalid stored trace context — skip linking */ }
         }
     }
 

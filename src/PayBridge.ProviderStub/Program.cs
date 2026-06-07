@@ -27,7 +27,7 @@ app.MapPost("/payments/submit", async (
     // Simulate provider processing delay
     await Task.Delay(rng.Next(100, 600));
 
-    var providerTxId = $"prov_{Guid.NewGuid():N[..12]}";
+    var providerTxId = $"prov_{Guid.NewGuid().ToString("N")[..12]}";
     var isSuccess    = rng.NextDouble() < 0.92; // 92% success rate
 
     logger.LogInformation(

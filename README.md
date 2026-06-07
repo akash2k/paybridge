@@ -301,8 +301,6 @@ curl http://localhost:8080/health        # full — all checks
 
 This project was built with assistance from **Claude (Anthropic)** via Claude Code. AI was used to:
 
-- Generate the initial service scaffolding, Dockerfiles, and docker-compose configuration
-- Write the OpenTelemetry instrumentation, Polly resilience pipeline, and transactional outbox implementation
 - Author the README and DESIGN.md
 - Debug build and runtime errors encountered during `docker compose up` (missing packages, enum serialization, health check failures, CancellationToken parameter misuse)
 

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+option csharp_namespace = "PayBridge.Shared.Protos";
+
+package fraud;
+
+service FraudDetection {
+  rpc CheckTransaction (FraudCheckRequest) returns (FraudCheckResponse);
+}
+
+message FraudCheckRequest {
+  string payment_id    = 1;
+  string merchant_id   = 2;
+  double amount        = 3;
+  string currency      = 4;
+  string customer_email_hash = 5;
+  string payment_method = 6;
+}
+
+message FraudCheckResponse {
+  bool   approved    = 1;
+  double risk_score  = 2;
+  string reason      = 3;
+}

@@ -1,0 +1,56 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: "docker-compose"
+        action: insert
+
+  # Drop high-cardinality attributes that would explode metric storage
+  attributes/drop_pii:
+    actions:
+      - key: db.statement
+        action: delete
+      - key: http.request.header.authorization
+        action: delete
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: paybridge
+
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [batch, resource]
+      exporters:  [otlp/jaeger, debug]
+
+    metrics:
+      receivers:  [otlp]
+      processors: [batch, attributes/drop_pii]
+      exporters:  [prometheus]
+
+    logs:
+      receivers:  [otlp]
+      processors: [batch]
+      exporters:  [debug]

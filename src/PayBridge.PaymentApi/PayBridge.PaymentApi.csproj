@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>PayBridge.PaymentApi</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../PayBridge.Shared/PayBridge.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- gRPC -->
+    <PackageReference Include="Grpc.AspNetCore"                          Version="2.65.0" />
+    <PackageReference Include="Grpc.Net.Client"                          Version="2.65.0" />
+
+    <!-- EF Core + Postgres -->
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL"    Version="8.0.4" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design"     Version="8.0.7" PrivateAssets="All" />
+
+    <!-- Redis -->
+    <PackageReference Include="StackExchange.Redis"                      Version="2.8.16" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="8.0.7" />
+
+    <!-- Kafka -->
+    <PackageReference Include="Confluent.Kafka"                          Version="2.5.0" />
+
+    <!-- OpenTelemetry -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting"         Version="1.9.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.9.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http"       Version="1.9.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.GrpcNetClient" Version="1.9.0-beta.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.EntityFrameworkCore" Version="1.0.0-beta.12" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.9.0" />
+
+    <!-- Resilience (Polly v8) -->
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience"     Version="8.8.0" />
+    <PackageReference Include="Microsoft.Extensions.Resilience"          Version="8.8.0" />
+
+    <!-- Logging -->
+    <PackageReference Include="Serilog.AspNetCore"                       Version="8.0.2" />
+    <PackageReference Include="Serilog.Sinks.Console"                    Version="6.0.0" />
+    <PackageReference Include="Serilog.Enrichers.Environment"            Version="3.0.1" />
+
+    <!-- Health Checks -->
+    <PackageReference Include="AspNetCore.HealthChecks.Redis"            Version="8.0.1" />
+    <PackageReference Include="AspNetCore.HealthChecks.NpgSql"           Version="8.0.1" />
+  </ItemGroup>
+</Project>

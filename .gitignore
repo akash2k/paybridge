@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# .NET build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# Rider / JetBrains
+.idea/
+
+# VSCode
+.vscode/
+
+# Environment / secrets
+.env
+*.env.local
+appsettings.*.json
+!appsettings.json
+
+# Test results
+TestResults/
+coverage/
